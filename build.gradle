@@ -1,0 +1,42 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.1.1'
+}
+
+group = 'com.example'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // 1. Spring Boot 버전 관리(BOM)를 핵심 구성에 적용
+    implementation platform(org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES)
+    compileOnly platform(org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES)
+    annotationProcessor platform(org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES)
+
+    // 2. 스타터 및 라이브러리 (버전 생략 가능)
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // Swagger UI
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:3.0.3'
+
+    // 3. Lombok (위에서 platform을 지정했으므로 버전 생략 가능)
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+}
+
+
+// plain jar가 함께 생기면 Docker COPY 대상이 모호해지므로 비활성화
+tasks.named('jar') {
+    enabled = false
+}

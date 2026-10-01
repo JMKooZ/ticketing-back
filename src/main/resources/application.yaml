@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: ticketing-back
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: 8080
+  shutdown: graceful          # 배포 시 처리 중인 요청을 마무리하고 종료
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health       # /actuator/health 만 노출
+
+springdoc:
+  swagger-ui:
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true

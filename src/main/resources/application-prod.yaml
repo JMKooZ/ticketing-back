@@ -1,0 +1,11 @@
+# 운영(AWS) 프로파일: SPRING_PROFILES_ACTIVE=prod 로 실행
+logging:
+  level:
+    root: INFO
+    com.example.ticketing_back: INFO
+
+springdoc:
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:true}     # 필요하면 환경변수로 끌 수 있음
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:true}
