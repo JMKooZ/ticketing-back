@@ -299,13 +299,231 @@ dependencies {
 
 ---
 
-## 8. 진행 현황
+## 8. AWS 수동 배포 (Step 3)
+
+로컬에서 만든 이미지를 ECR에 올리고, EC2에서 받아 실행해서 인터넷에서 Swagger를 여는 것이 목표입니다.
+이 단계에서 만지는 서비스는 Step 5 자동화에서 그대로 쓰입니다.
+
+| 서비스 | 역할 | 비유 |
+|---|---|---|
+| ECR | 이미지 저장소 | 이미지용 GitHub |
+| EC2 | 컨테이너를 돌릴 서버 | 빌려 쓰는 PC |
+| 보안그룹 | 서버 앞의 방화벽 | 출입 허용 목록 |
+| IAM 역할 | 서버/사용자가 가진 권한 | 출입증 |
+
+```
+내 PC: docker build → docker push ──▶ [ECR] ◀── docker pull ── [EC2: docker run]
+                                                                     ▲
+                                                브라우저 ─ :8080 ─ [보안그룹]
+```
+
+### 8-1. 계정 안전 설정 (콘솔, 리전: 아시아 태평양(서울) ap-northeast-2)
+
+1. 루트 계정에 MFA 설정
+2. 결제 → Budgets → 월 예산 $5 알림 생성
+3. IAM 사용자 생성 (루트 계정은 평소에 쓰지 않음)
+
+| 계정 | 용도 |
+|---|---|
+| ticketing-dev | 웹 콘솔 작업 전부 (AdministratorAccess + MFA, 개인 학습 계정 한정) |
+| ecr-push-local | 내 PC의 `aws configure` 전용 (ECR PowerUser, 콘솔 로그인 없음). **Step 5 완료 후 키 삭제** |
+
+- 로그인 후 리전이 다른 값(예: 오하이오)으로 바뀌어 있을 수 있어서 화면을 열 때마다 확인합니다.
+- 서비스는 리전별로 따로 존재합니다(IAM은 전역).
+- 액세스 키는 GitHub, README, 채팅에 절대 올리지 않습니다.
+
+### 8-2. ECR 저장소와 이미지 push
+
+콘솔: ECR → 프라이빗 → 리포지토리 생성 (이름 `ticketing-back`)
+
+```powershell
+winget install -e --id Amazon.AWSCLI       # 설치 후 PowerShell 재시작
+aws configure                              # ecr-push-local 의 키, region=ap-northeast-2, output=json
+aws sts get-caller-identity                # Arn 이 ecr-push-local 인지 확인 ("나는 누구인가")
+
+$REGION   = "ap-northeast-2"
+$ACCOUNT  = aws sts get-caller-identity --query Account --output text
+$REGISTRY = "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
+docker tag ticketing-back:latest "$REGISTRY/ticketing-back:v1"     # 복제가 아니라 이름표 추가
+docker push "$REGISTRY/ticketing-back:v1"
+```
+
+### 8-3. EC2 준비 (콘솔)
+
+**IAM 역할 `ticketing-ec2-role`** (신뢰 엔터티: EC2)
+
+- `AmazonEC2ContainerRegistryReadOnly` : ECR에서 이미지 받기
+- `AmazonSSMManagedInstanceCore` : SSH 없이 접속(Session Manager), Step 5 자동 배포에서도 사용
+
+**EC2 인스턴스**
+
+| 설정 | 값 |
+|---|---|
+| 이름 / AMI | ticketing-back / Amazon Linux 2023 |
+| 인스턴스 유형 | t3.small (계정 플랜의 프리티어 표시 확인) |
+| 키 페어 | 없음 (SSH 미사용, Session Manager로 접속) |
+| 네트워크 | 기본 VPC, 퍼블릭 IP 자동 할당 활성화 |
+| 보안그룹 `ticketing-sg` | 인바운드 TCP 8080 / 소스 **내 IP** (SSH 22번은 열지 않음) |
+| 스토리지 | 20GiB gp3 |
+| IAM 인스턴스 프로파일 | ticketing-ec2-role (고급 세부 정보 안쪽) |
+
+- Swagger는 인증이 없어서 **내 IP만** 허용합니다. IP가 바뀌면 소스를 갱신합니다.
+- 서버 안에는 액세스 키를 넣지 않고 **역할**을 붙입니다. 서버가 임시 자격 증명을 자동으로 받습니다.
+
+### 8-4. 서버에서 실행 (Session Manager 접속)
+
+```
+EC2 → 인스턴스 선택 → 연결 → Session Manager 탭 → 연결
+```
+
+```bash
+sudo dnf install -y docker
+sudo systemctl enable --now docker
+
+REGION=ap-northeast-2
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+
+aws ecr get-login-password --region $REGION | sudo docker login --username AWS --password-stdin $REGISTRY
+sudo docker pull $REGISTRY/ticketing-back:v1
+
+sudo docker run -d --name ticketing-back --restart unless-stopped \
+  -p 8080:8080 -e SPRING_PROFILES_ACTIVE=prod \
+  $REGISTRY/ticketing-back:v1
+
+sudo docker logs -f ticketing-back                 # Ctrl+C 로 빠져나옴
+curl http://localhost:8080/actuator/health         # {"status":"UP"}
+```
+
+브라우저에서는 EC2 콘솔의 **퍼블릭 IPv4 주소**로 접속합니다.
+
+```
+http://<퍼블릭IP>:8080/swagger-ui/index.html
+http://<퍼블릭IP>:8080/api/ping        ← "profile":"prod"
+```
+
+### 8-5. 겪은 문제와 배운 것
+
+| 증상 | 원인 / 교훈 |
+|---|---|
+| 브라우저 접속 불가 (`172.31.x.x`) | 프라이빗 IP는 VPC 내부 전용. **퍼블릭 IPv4**로 접속해야 함 |
+| 서버에서 URL만 입력하면 `No such file or directory` | 셸이 주소를 프로그램 이름으로 해석. `curl <URL>` 로 실행 |
+| 응답 없이 계속 로딩 | 보안그룹이 막은 경우(내 IP 변경, 사내 방화벽 등). 서버 안 `curl localhost:8080` 으로 앱 정상 여부부터 분리해서 확인 |
+| `http` 가 `https` 로 바뀜 | 주소창에 `http://` 명시 |
+
+- 서버에 키를 넣지 않았는데도 ECR 로그인이 되는 이유: 서버에 붙인 **역할**이 임시 자격 증명을 주기 때문
+- 비용: 쓰지 않을 때는 인스턴스 **중지** (EBS/ECR 소액 과금은 남음). 중지 후 시작하면 퍼블릭 IP가 바뀜. 탄력적 IP를 쓰면 학습 후 반드시 해제
+
+---
+
+## 9. CI: GitHub Actions (Step 4)
+
+push / PR 때마다 **"빌드와 이미지 생성이 되는지"** 자동으로 확인합니다. 이 단계에서는 AWS에 접근하지 않습니다.
+
+`.github/workflows/ci.yml`
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 소스 가져오기
+        uses: actions/checkout@v4
+
+      - name: Java 21 설치
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Gradle 설정 (의존성 캐시 포함)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: jar 빌드
+        run: |
+          chmod +x gradlew
+          ./gradlew bootJar
+
+      - name: Docker 이미지 빌드 (push 안 함)
+        run: docker build -t ticketing-back:${{ github.sha }} .
+```
+
+| 부분 | 의미 |
+|---|---|
+| `on:` | 언제 실행할지 (PR 생성/갱신, main push) |
+| `runs-on: ubuntu-latest` | GitHub이 빌려주는 **임시 리눅스 서버(러너)**. 끝나면 폐기되어 매번 깨끗한 상태 |
+| `uses:` / `run:` | 남이 만든 재사용 액션 / 터미널 명령 직접 실행 |
+| `${{ github.sha }}` | 커밋 해시. 이미지 태그로 사용 (Step 5에서 ECR 태그) |
+| `concurrency` | 같은 브랜치의 이전 실행 취소 (낭비 방지) |
+
+### 9-1. gradlew 실행 권한
+
+Windows 커밋에서는 실행 권한 표시가 빠질 수 있어서, Git에 직접 기록합니다.
+
+```powershell
+git update-index --chmod=+x gradlew
+git ls-files --stage gradlew          # 100755 로 시작하면 성공
+```
+
+### 9-2. 브랜치 보호 (Ruleset)
+
+> status check 목록(`build`)은 워크플로가 **한 번 이상 실행된 뒤**에야 검색됩니다.
+> PR 필수 규칙을 먼저 켜면 `main` 직접 push가 막혀 `ci.yml`을 올릴 수 없으므로 순서를 지킵니다.
+
+1. Ruleset 생성: 이름 `protect-main`, target = default branch, **Enforcement: Disabled**
+2. `ci.yml`을 `main`에 push → Actions 탭에서 `build`가 초록인지 확인
+3. Ruleset 편집: `Require status checks to pass` → Add checks → `build` 선택, Enforcement를 **Active** 로 변경
+
+| 설정 | 값 |
+|---|---|
+| Required approvals | 0 (본인 PR은 본인이 승인할 수 없어서 1 이상이면 머지가 막힘) |
+| Restrict deletions / Block force pushes | 켜 둠 |
+
+Active 이후 변경은 **브랜치 → PR → build 통과 → Merge** 순서로만 `main`에 들어갑니다.
+
+```powershell
+git switch -c feature/xxx
+git add . ; git commit -m "feat: ..."
+git push -u origin feature/xxx          # GitHub에서 PR 생성 → build 초록 확인 → Merge
+```
+
+### 9-3. 실험 기록
+
+- **캐시**: 두 번째 실행에서 Gradle 단계가 더 빨라짐
+- **일부러 실패**: 컴파일 오류가 있는 PR → 빨간 X, 로그에서 `jar 빌드` 단계의 에러 확인, Merge 버튼 비활성화 확인 → 수정 후 초록으로 바뀜
+
+### 9-4. CI의 한계
+
+이 CI는 **컴파일과 이미지 생성만** 확인합니다. 앱이 실제로 **기동되는지**(설정 오류 등)는 확인하지 못합니다.
+Step 5에서 서버 헬스체크와 롤백이 이 부분을 보완합니다.
+
+---
+
+## 10. 진행 현황
 
 - [x] Step 0. 로컬 `bootRun` + Swagger 확인
 - [x] Step 1. Git / GitHub 저장소 연결
 - [x] Step 2. Dockerfile 작성, 로컬 컨테이너 실행, 레이어 캐시 실험
-- [ ] Step 3. AWS 수동 배포 1회 (EC2, ECR, 보안그룹, IAM 역할)
-- [ ] Step 4. CI: GitHub Actions 빌드 (PR 검증)
+- [x] Step 3. AWS 수동 배포 (ECR, EC2, 보안그룹, IAM 역할, Swagger 접속 확인)
+- [x] Step 4. CI: GitHub Actions 빌드, 브랜치 보호 ruleset
 - [ ] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백
 - [ ] Step 6. 설정/비밀 분리(프로파일, Parameter Store) + RDS 연결
 - [ ] Step 7. 운영 습관 (로그, 비용 알림, 리소스 정리)
