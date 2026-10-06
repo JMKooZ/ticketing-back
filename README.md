@@ -517,14 +517,338 @@ Step 5에서 서버 헬스체크와 롤백이 이 부분을 보완합니다.
 
 ---
 
-## 10. 진행 현황
+## 10. CD: GitHub Actions 자동 배포 (Step 5)
+
+`main`에 머지하면 **빌드 → ECR push → EC2 배포 → 헬스체크 → 실패 시 롤백**까지 자동으로 진행됩니다.
+
+```
+PR 머지(main) → build 통과 → jar → 이미지 빌드 → ECR push (태그 = 커밋 해시)
+             → SSM 으로 EC2 에서 deploy.sh 실행 → 새 컨테이너 → 헬스체크 → 실패 시 이전 버전으로 롤백
+```
+
+### 10-1. 핵심 개념: OIDC (키 없는 인증)
+
+GitHub Actions가 "나는 `<저장소>`의 `main`에서 실행 중이다"라는 **신분증(토큰)**을 AWS에 제시하면, AWS가 역할의 **신뢰 정책**과 대조해서 임시 권한을 빌려줍니다.
+AWS 액세스 키를 GitHub에 저장할 필요가 없고, 유출될 장기 키도 없습니다.
+
+### 10-2. AWS 설정 (콘솔, ticketing-dev 로 로그인)
+
+**① ID 제공업체**: IAM → ID 제공업체 → 공급자 추가
+
+| 항목 | 값 |
+|---|---|
+| 유형 | OpenID Connect |
+| 공급자 URL | `https://token.actions.githubusercontent.com` |
+| 대상(Audience) | `sts.amazonaws.com` |
+
+**② 역할 `github-actions-deploy`**: 신뢰 정책(사용자 지정)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:ref:refs/heads/main" }
+    }
+  }]
+}
+```
+
+- `sub`는 **`main` 브랜치에서 실행된 워크플로만** 이 역할을 쓰게 제한합니다(PR 브랜치는 거절).
+- **이 저장소의 `sub`는 `repo:<소유자>/<저장소>:...` 가 아니라 소유자/저장소의 숫자 ID가 붙은 형식**이었습니다.
+  실제 값은 아래 10-9의 디버그 워크플로로 확인했습니다.
+
+**③ 역할의 인라인 정책 `deploy-policy`** (최소 권한: 이 ECR 저장소 push + 이 서버 한 대에 명령)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "EcrAuth", "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    { "Sid": "EcrPush", "Effect": "Allow",
+      "Action": ["ecr:BatchCheckLayerAvailability","ecr:InitiateLayerUpload","ecr:UploadLayerPart",
+                 "ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage"],
+      "Resource": "arn:aws:ecr:ap-northeast-2:<ACCOUNT_ID>:repository/ticketing-back" },
+    { "Sid": "SsmSend", "Effect": "Allow", "Action": "ssm:SendCommand",
+      "Resource": [ "arn:aws:ec2:ap-northeast-2:<ACCOUNT_ID>:instance/<INSTANCE_ID>",
+                    "arn:aws:ssm:ap-northeast-2::document/AWS-RunShellScript" ] },
+    { "Sid": "SsmRead", "Effect": "Allow",
+      "Action": ["ssm:GetCommandInvocation","ssm:ListCommandInvocations"], "Resource": "*" }
+  ]
+}
+```
+
+### 10-3. 서버: 배포 스크립트 `/opt/ticketing/deploy.sh`
+
+Session Manager로 접속해서 만듭니다. Step 3에서 손으로 치던 명령을 한 번에 실행하고, **실패하면 이전 버전으로 되돌립니다.**
+
+```bash
+sudo mkdir -p /opt/ticketing
+sudo tee /opt/ticketing/deploy.sh > /dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export HOME=/root                     # SSM 실행 환경에는 HOME 이 없어 docker login 이 실패할 수 있음
+
+IMAGE="$1"
+REGION=ap-northeast-2
+NAME=ticketing-back
+
+run_container() {
+  docker rm -f $NAME 2>/dev/null || true
+  docker run -d --name $NAME --restart unless-stopped \
+    -p 8080:8080 \
+    -e SPRING_PROFILES_ACTIVE=prod \
+    "$1"
+}
+
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+docker pull "$IMAGE"
+
+PREV=$(docker inspect -f '{{.Config.Image}}' $NAME 2>/dev/null || true)   # 롤백 대상(현재 실행 중인 이미지)
+
+run_container "$IMAGE"
+
+for i in $(seq 1 30); do
+  if curl -fs http://localhost:8080/actuator/health > /dev/null; then
+    echo "배포 성공: $IMAGE"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "헬스체크 실패: $IMAGE" >&2
+docker logs --tail 50 $NAME >&2 || true
+if [ -n "$PREV" ]; then
+  echo "이전 버전으로 롤백: $PREV" >&2
+  run_container "$PREV"
+fi
+exit 1
+EOF
+sudo chmod +x /opt/ticketing/deploy.sh
+sudo bash -n /opt/ticketing/deploy.sh    # 문법 검사 (출력이 없으면 정상)
+```
+
+- 화면에서 `\` 가 `₩` 로 보이는 것은 한글 폰트 표시 문제입니다(`grep -n '₩' 파일` 결과가 없으면 정상).
+- 서버에서 한 번 직접 실행해 보면 자동화 전에 스크립트 자체를 검증할 수 있습니다: `sudo /opt/ticketing/deploy.sh <ECR주소>/ticketing-back:v1`
+
+### 10-4. GitHub 변수
+
+`Settings → Secrets and variables → Actions → **Variables** 탭 → Repository variables`
+
+| 이름 | 값 |
+|---|---|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<ACCOUNT_ID>:role/github-actions-deploy` (IAM에서 **복사**) |
+| `EC2_INSTANCE_ID` | `i-` 로 시작하는 실제 인스턴스 ID (EC2 콘솔에서 **복사**) |
+
+비밀이 아니라서 Secrets가 아닌 **Variables**를 씁니다. 워크플로는 `vars.` 로 읽으므로 **Secrets 탭에 만들면 비어서 읽힙니다.**
+값에는 ARN/ID만 넣습니다(앞뒤 공백, 따옴표, `이름 :` 같은 설명 글자 금지).
+
+### 10-5. 워크플로 `.github/workflows/ci.yml`
+
+`build` 잡 이름은 ruleset(필수 체크)이 검사하는 이름이라 바꾸지 않습니다.
+
+```yaml
+name: ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: ticketing-back
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # main 배포 중에는 취소하지 않음
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: |
+          chmod +x gradlew
+          ./gradlew bootJar
+      - run: docker build -t ticketing-back:${{ github.sha }} .
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write        # OIDC 토큰 발급에 필요
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: |
+          chmod +x gradlew
+          ./gradlew bootJar
+
+      - name: AWS 인증 (OIDC, 키 없음)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR 로그인
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 이미지 빌드 및 push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: EC2에 배포 명령 전송 (SSM)
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"/opt/ticketing/deploy.sh $IMAGE\"]" \
+            --query "Command.CommandId" --output text)
+          echo "CMD_ID=$CMD_ID" >> $GITHUB_ENV
+
+      - name: 배포 완료 대기 (실패하면 이 단계에서 빨간 X)
+        run: |
+          aws ssm wait command-executed \
+            --command-id "$CMD_ID" --instance-id "${{ vars.EC2_INSTANCE_ID }}"
+
+      - name: 서버 배포 로그 출력
+        if: always()
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
+            --query "{status:Status,out:StandardOutputContent,err:StandardErrorContent}" --output json
+```
+
+| 설계 포인트 | 이유 |
+|---|---|
+| `deploy`는 `push` + `main` 일 때만 | PR 단계에서는 AWS를 건드리지 않음 (PR에서는 `deploy`가 Skipped 로 표시되는 것이 정상) |
+| `permissions: id-token: write` 는 `deploy` 잡에만 | OIDC 토큰이 필요한 잡에만 최소 권한 부여 |
+| 이미지 태그 = `github.sha` | 서버에서 도는 코드가 정확히 어느 커밋인지 추적, 되돌리기 쉬움 |
+| `cancel-in-progress` 는 PR 에서만 | main 배포 중 다음 push 가 와도 배포를 중간에 끊지 않음 |
+
+### 10-6. 배포 확인 방법
+
+| 어디서 | 확인 |
+|---|---|
+| GitHub Actions | `build`, `deploy` 모두 초록. `서버 배포 로그 출력` 의 `"status": "Success"` 와 `배포 성공: ...:<커밋해시>` |
+| 브라우저 | `http://<퍼블릭IP>:8080/api/ping` 의 값이 바뀐 코드대로 나옴 |
+| 서버 | `sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"` 의 IMAGE 태그가 **커밋 해시**. GitHub 커밋 해시 앞부분과 비교 |
+| ECR 콘솔 | `ticketing-back` 저장소에 커밋 해시 태그 이미지 생성 |
+| Systems Manager | Run Command → 명령 기록에 `AWS-RunShellScript` 성공 |
+
+### 10-7. 롤백 실험
+
+CI는 **컴파일과 이미지 생성만** 확인하고 앱이 **기동되는지**는 확인하지 못합니다. 그래서 일부러 기동이 안 되는 설정으로 서버의 방어(헬스체크 + 롤백)를 확인했습니다.
+
+```yaml
+# application-prod.yaml 에 일부러 추가 (실험 후 되돌림)
+server:
+  port: abc
+```
+
+| 단계 | 결과 |
+|---|---|
+| PR의 `build` | **초록** (컴파일만 하므로 통과) |
+| 머지 후 `deploy` | `배포 완료 대기`에서 빨간 X (서버 스크립트가 실패로 종료) |
+| 서버 상태 | 헬스체크 실패를 감지하고 **이전 버전 컨테이너로 복구**. `/api/ping` 은 계속 응답 |
+
+- `aws ssm wait command-executed` 의 `Status "Failed"` 는 서버의 `deploy.sh` 가 `exit 1` 로 끝났다는 뜻입니다(롤백 후에도 **배포는 실패로 알려야** 하므로 의도된 동작).
+- 실험 후에는 **설정을 되돌리는 PR을 머지해서 `main`을 정상 상태로 복구**해야 합니다. 깨진 설정이 `main`에 남아 있으면 이후 모든 배포가 같은 이유로 실패합니다.
+
+### 10-8. 트러블슈팅 기록
+
+| 증상 (Actions 로그) | 원인과 교훈 |
+|---|---|
+| `Credentials could not be loaded ... Could not load credentials from any providers` | 변수 `AWS_ROLE_ARN`이 **비어서** 읽힘 (Secrets 탭에 만들었거나 이름 오타) |
+| `Source Account ID is needed if the Role Name is provided and not the Role Arn` | 변수 값이 `arn:aws:iam::...` 형식이 아님. 안내 문구째로 붙여넣었거나 따옴표/공백이 섞임 → IAM에서 ARN 복사 |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | 이 문구는 `sub` 불일치, `aud` 불일치, 존재하지 않는 역할 등 **원인이 여러 개**. 아래 10-9 방법으로 실제 값을 대조해서 해결. 이 저장소는 `sub` 에 **숫자 ID** 가 포함되어 있었음 |
+| `Value '[]' at 'instanceIds' failed to satisfy constraint` | 변수 `EC2_INSTANCE_ID`가 비어서 읽힘 |
+| `Invalid length for parameter CommandId, value: 0` (로그 출력 단계) | 앞 단계 실패로 `CMD_ID` 가 비었는데 `if: always()` 단계가 실행된 **부수 효과** (진짜 원인은 앞 단계) |
+| 서버 터미널에서 `iam:GetRole` 이 AccessDenied | 서버 역할(`ticketing-ec2-role`)에는 IAM 조회 권한이 없음 (**의도된 최소 권한**). 콘솔 CloudShell(ticketing-dev)에서 실행해야 함 |
+
+배운 점: 같은 에러 문구라도 원인이 여러 개일 수 있으므로, **설정 화면을 눈으로 비교하기보다 실제 값을 출력해서 대조**하는 것이 가장 빠릅니다.
+
+### 10-9. 디버깅 도구
+
+**CloudShell** (콘솔 우측 상단 `>_`, 로그인한 IAM 사용자 권한으로 실행)
+
+```bash
+aws sts get-caller-identity                                  # 내가 누구인지
+aws iam get-role --role-name github-actions-deploy --query "Role.[Arn,AssumeRolePolicyDocument]" --output json
+aws iam list-open-id-connect-providers
+aws iam get-open-id-connect-provider --open-id-connect-provider-arn arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
+```
+
+**OIDC 토큰 클레임 출력 워크플로** (별도 브랜치에서 실행하고 `main`에는 합치지 않음. 토큰 자체는 출력하지 않음)
+
+```yaml
+name: oidc-debug
+on:
+  push:
+    branches: [debug/oidc]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  show-claims:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          python3 - <<'PY'
+          import os, json, base64, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
+          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          jwt = json.load(urllib.request.urlopen(req))["value"]
+          payload = jwt.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          for k in ["iss", "aud", "sub", "repository", "repository_owner", "ref"]:
+              print(k, "=", claims.get(k))
+          PY
+```
+
+### 10-10. 마무리 정리
+
+- [ ] 롤백 실험 후 깨진 설정을 되돌리는 PR 머지 (`main`에 남은 `server.port: abc` 제거)
+- [ ] 수동 단계용 IAM 사용자 `ecr-push-local`의 액세스 키 비활성화 후 삭제, PC의 `~/.aws` 자격 증명 삭제
+- [ ] 디버그 브랜치(`debug/oidc`) 삭제 (`git push origin --delete debug/oidc`)
+- [ ] 워크플로 경고 정리: `ubuntu-latest` → `ubuntu-24.04` 고정, `actions/setup-java@v4` → `v5`, `서버 배포 로그 출력` 의 조건을 `if: always() && env.CMD_ID != ''` 로 (한 번에 하나씩 PR)
+
+---
+
+## 11. 진행 현황
 
 - [x] Step 0. 로컬 `bootRun` + Swagger 확인
 - [x] Step 1. Git / GitHub 저장소 연결
 - [x] Step 2. Dockerfile 작성, 로컬 컨테이너 실행, 레이어 캐시 실험
 - [x] Step 3. AWS 수동 배포 (ECR, EC2, 보안그룹, IAM 역할, Swagger 접속 확인)
 - [x] Step 4. CI: GitHub Actions 빌드, 브랜치 보호 ruleset
-- [ ] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백
+- [x] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백 (실험 완료)
 - [ ] Step 6. 설정/비밀 분리(프로파일, Parameter Store) + RDS 연결
 - [ ] Step 7. 운영 습관 (로그, 비용 알림, 리소스 정리)
 - [ ] Step 8~ 티케팅 기능 (재고/동시성 → Redis → Kafka → SSE/대기열)
