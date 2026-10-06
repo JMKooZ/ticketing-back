@@ -3,16 +3,24 @@ spring:
     name: ticketing-back
   lifecycle:
     timeout-per-shutdown-phase: 20s
+  datasource:
+    url: jdbc:mysql://localhost:3307/ticketing?serverTimezone=Asia/Seoul
+    username: root
+    password: root
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none        # 아직 엔티티가 없으므로 스키마를 건드리지 않음
 
 server:
   port: 8080
-  shutdown: graceful          # 배포 시 처리 중인 요청을 마무리하고 종료
+  shutdown: graceful
 
 management:
   endpoints:
     web:
       exposure:
-        include: health       # /actuator/health 만 노출
+        include: health
 
 springdoc:
   swagger-ui:

@@ -1,4 +1,10 @@
-# 운영(AWS) 프로파일: SPRING_PROFILES_ACTIVE=prod 로 실행
+# 운영(AWS) 프로파일: SPRING_PROFILES_ACTIVE=prod
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
 logging:
   level:
     root: INFO
@@ -6,6 +12,6 @@ logging:
 
 springdoc:
   swagger-ui:
-    enabled: ${SWAGGER_ENABLED:true}     # 필요하면 환경변수로 끌 수 있음
+    enabled: ${SWAGGER_ENABLED:true}
   api-docs:
     enabled: ${SWAGGER_ENABLED:true}

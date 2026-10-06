@@ -33,6 +33,10 @@ dependencies {
     // 3. Lombok (위에서 platform을 지정했으므로 버전 생략 가능)
     compileOnly 'org.projectlombok:lombok'
     annotationProcessor 'org.projectlombok:lombok'
+
+    // db 추가
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly 'com.mysql:mysql-connector-j'
 }
 
 
