@@ -9,5 +9,3 @@ springdoc:
     enabled: ${SWAGGER_ENABLED:true}     # 필요하면 환경변수로 끌 수 있음
   api-docs:
     enabled: ${SWAGGER_ENABLED:true}
-server:
- port: abc
