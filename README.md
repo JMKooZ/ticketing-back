@@ -571,11 +571,11 @@ AWS 액세스 키를 GitHub에 저장할 필요가 없고, 유출될 장기 키�
     { "Sid": "EcrAuth", "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
     { "Sid": "EcrPush", "Effect": "Allow",
       "Action": ["ecr:BatchCheckLayerAvailability","ecr:InitiateLayerUpload","ecr:UploadLayerPart",
-                 "ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage"],
+        "ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage"],
       "Resource": "arn:aws:ecr:ap-northeast-2:<ACCOUNT_ID>:repository/ticketing-back" },
     { "Sid": "SsmSend", "Effect": "Allow", "Action": "ssm:SendCommand",
       "Resource": [ "arn:aws:ec2:ap-northeast-2:<ACCOUNT_ID>:instance/<INSTANCE_ID>",
-                    "arn:aws:ssm:ap-northeast-2::document/AWS-RunShellScript" ] },
+        "arn:aws:ssm:ap-northeast-2::document/AWS-RunShellScript" ] },
     { "Sid": "SsmRead", "Effect": "Allow",
       "Action": ["ssm:GetCommandInvocation","ssm:ListCommandInvocations"], "Resource": "*" }
   ]
@@ -841,14 +841,308 @@ jobs:
 
 ---
 
-## 11. 진행 현황
+## 11. RDS 연결과 비밀 관리 (Step 6)
+
+앱이 DB를 쓰게 만들고, **DB 비밀번호를 코드/이미지/GitHub에 두지 않고** Parameter Store에서 가져옵니다.
+
+```
+브라우저 ─ :8080 ─▶ [EC2 + 앱 컨테이너]  (보안그룹 ticketing-sg)
+                         │ 3306 (ticketing-sg 에서 오는 요청만 허용)
+                         ▼
+                    [RDS MySQL ticketing-db]  (보안그룹 ticketing-db-sg, 퍼블릭 액세스 없음)
+
+Parameter Store ──(서버 역할이 읽기)──▶ 접속 정보(URL / 사용자 / 비밀번호)
+```
+
+### 11-1. RDS 생성 설정 (콘솔, 서울 리전)
+
+| 항목 | 값 |
+|---|---|
+| 엔진 / 버전 | MySQL 8.4.x |
+| 가용성 | 단일 DB 인스턴스 (다중 AZ 아님) |
+| 식별자 / 마스터 사용자 | `ticketing-db` / `admin` (암호는 자체 관리, **문서/채팅에 기록하지 않음**) |
+| 인스턴스 / 스토리지 | `db.t4g.micro` / gp3 20GiB, 스토리지 자동 조정 해제 |
+| 연결 | 기본 VPC, **퍼블릭 액세스 아니요**, 보안그룹 **새로 생성 `ticketing-db-sg`** (`default` 공용 그룹은 쓰지 않음) |
+| 추가 구성 | **초기 데이터베이스 이름 `ticketing`**, 백업 보존 1일, 삭제 방지 해제(학습용), 향상된 모니터링 해제 |
+
+- 초기 DB 이름을 비워 두면 `Unknown database 'ticketing'` 으로 앱이 실패합니다.
+- Database Insights는 기본(표준)만 사용하고 Advanced는 선택하지 않습니다(추가 요금).
+
+### 11-2. 보안그룹 참조 (핵심 개념)
+
+`ticketing-db-sg` 인바운드: **MySQL/Aurora 3306, 소스 = 보안그룹 `ticketing-sg`**
+
+- IP 대역이 아니라 "`ticketing-sg` 가 붙은 리소스에서 오는 요청만" 허용합니다. 서버 IP가 바뀌어도 규칙을 고칠 필요가 없습니다.
+- 퍼블릭 액세스를 막았기 때문에 **내 PC에서 RDS로 직접 접속할 수 없는 것이 정상**입니다.
+- 서버에서 연결 확인: `timeout 3 bash -c "</dev/tcp/<RDS_ENDPOINT>/3306" && echo "3306 열림" || echo "3306 막힘"`
+
+### 11-3. Parameter Store
+
+리전별로 따로 저장되고, **이름은 수정할 수 없습니다**(삭제 후 재생성). 비밀번호는 **SecureString** 으로 저장합니다.
+
+| 이름 | 유형 | 용도 |
+|---|---|---|
+| `/ticketing/prod/db-url` | String | `jdbc:mysql://<RDS_ENDPOINT>:3306/ticketing?serverTimezone=Asia/Seoul` |
+| `/ticketing/prod/db-username` | String | `admin` |
+| `/ticketing/prod/db-password` | SecureString | RDS 마스터 암호 |
+| `/config/ticketing-back_prod/spring.datasource.url` | String | 같은 값 (아래 참고) |
+| `/config/ticketing-back_prod/spring.datasource.username` | String | 같은 값 |
+| `/config/ticketing-back_prod/spring.datasource.password` | SecureString | 같은 값 |
+
+> 이 이름 규칙(`/config/<앱이름>_<프로파일>/<속성이름>`)으로 파라미터를 추가한 뒤 RDS 연동 배포가 성공했습니다.
+> **TODO**: 소스에서 이 값을 읽도록 바꾼 내용(의존성, `spring.config.import` 등)을 여기에 기록합니다.
+> `deploy.sh` 가 아직 `/ticketing/prod/*` 를 읽는 동안에는 그 파라미터를 지우지 않습니다(지우면 배포 스크립트가 시작 단계에서 실패).
+
+CLI로 만들기 (CloudShell, 오타 방지). 비밀번호는 명령줄에 쓰지 않고 입력창으로 받습니다. **세 줄을 한 줄씩 따로 실행**합니다.
+
+```bash
+aws ssm put-parameter --region ap-northeast-2 --name /ticketing/prod/db-username --type String --value "admin"
+
+read -s -p "RDS 마스터 암호: " DBPW; echo          # 입력 중 글자가 보이지 않는 것이 정상
+aws ssm put-parameter --region ap-northeast-2 --name /ticketing/prod/db-password --type SecureString --value "$DBPW" --overwrite
+unset DBPW
+```
+
+서버 역할(`ticketing-ec2-role`)의 읽기 정책 (경로 한정, 최소 권한):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"],
+    "Resource": [
+      "arn:aws:ssm:ap-northeast-2:<ACCOUNT_ID>:parameter/ticketing/prod/*",
+      "arn:aws:ssm:ap-northeast-2:<ACCOUNT_ID>:parameter/config/ticketing-back_prod/*"
+    ]
+  }]
+}
+```
+
+### 11-4. 앱 연결 (로컬 개발)
+
+```gradle
+implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+runtimeOnly 'com.mysql:mysql-connector-j'
+```
+
+의존성이 들어가면 **로컬에서도 DB가 없으면 앱이 시작되지 않습니다.** 로컬용 MySQL은 Docker로 띄웁니다(호스트 포트 3307: PC에 MySQL이 있어도 충돌하지 않음). **백틱 없이 한 줄**로 실행합니다.
+
+```powershell
+docker run -d --name ticketing-mysql -p 3307:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=ticketing mysql:8.4
+docker logs ticketing-mysql --tail 5        # "ready for connections" 확인 (첫 실행은 10~20초)
+.\gradlew bootRun
+```
+
+- 로컬 확인: Swagger `GET /api/db-ping` → `{"db":"ticketing", ...}`, `/actuator/health` → `UP`
+- `application.yaml`의 `spring:` 키는 한 번만 써야 합니다(YAML은 중복 키가 에러).
+- 학습 실험: `docker stop ticketing-mysql` → `/actuator/health` 가 `DOWN`, `/api/db-ping` 이 500 → `docker start ticketing-mysql` 로 복구. DB가 안 붙는 버전은 헬스체크가 DOWN이라 배포가 롤백되는 이유입니다.
+
+### 11-5. deploy.sh 최종본 (서버 `/opt/ticketing/deploy.sh`)
+
+Step 5 버전에서 달라진 점: ① 파라미터를 읽어 컨테이너에 주입, ② **마지막 정상 이미지**를 기록해서 롤백 대상으로 사용, ③ 실패 시 핵심 에러를 먼저 출력.
+
+```bash
+sudo tee /opt/ticketing/deploy.sh > /dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export HOME=/root
+
+IMAGE="$1"
+REGION=ap-northeast-2
+NAME=ticketing-back
+LAST_GOOD_FILE=/opt/ticketing/last_good_image    # 마지막으로 헬스체크를 통과한 이미지
+
+get_param() {
+  aws ssm get-parameter --name "/ticketing/prod/$1" --with-decryption \
+    --region $REGION --query Parameter.Value --output text
+}
+
+# 컨테이너를 건드리기 전에 먼저 읽음: 실패하면 기존 서비스는 그대로 유지됨
+export DB_URL="$(get_param db-url)"
+export DB_USERNAME="$(get_param db-username)"
+export DB_PASSWORD="$(get_param db-password)"
+
+run_container() {
+  docker rm -f $NAME 2>/dev/null || true
+  docker run -d --name $NAME --restart unless-stopped \
+    -p 8080:8080 \
+    -e SPRING_PROFILES_ACTIVE=prod \
+    -e DB_URL -e DB_USERNAME -e DB_PASSWORD \
+    "$1"
+}
+
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+docker pull "$IMAGE"
+
+PREV=$(docker inspect -f '{{.Config.Image}}' $NAME 2>/dev/null || true)
+
+run_container "$IMAGE"
+
+for i in $(seq 1 30); do
+  if curl -fs http://localhost:8080/actuator/health > /dev/null; then
+    echo "$IMAGE" > "$LAST_GOOD_FILE"
+    echo "배포 성공: $IMAGE"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "헬스체크 실패: $IMAGE" >&2
+echo "---- 핵심 에러 ----" >&2
+docker logs $NAME 2>&1 | grep -E "Caused by|ERROR|Access denied|Communications|Exception" | tail -n 15 >&2 || true
+echo "---- 마지막 로그 30줄 ----" >&2
+docker logs --tail 30 $NAME >&2 || true
+
+ROLLBACK_TO=$(cat "$LAST_GOOD_FILE" 2>/dev/null || true)
+if [ -z "$ROLLBACK_TO" ]; then ROLLBACK_TO="$PREV"; fi
+if [ -n "$ROLLBACK_TO" ] && [ "$ROLLBACK_TO" != "$IMAGE" ]; then
+  echo "마지막 정상 버전으로 롤백: $ROLLBACK_TO" >&2
+  run_container "$ROLLBACK_TO"
+fi
+exit 1
+EOF
+sudo chmod 700 /opt/ticketing/deploy.sh
+sudo bash -n /opt/ticketing/deploy.sh      # 출력이 없으면 문법 정상
+```
+
+| 설계 포인트 | 이유 |
+|---|---|
+| `-e DB_URL` 처럼 **값 없이 이름만** 전달 | 값이 `docker run` 명령줄(`ps`, 로그)에 노출되지 않음 |
+| 파라미터 읽기를 컨테이너 교체 **전**에 수행 | 읽기가 실패하면(`set -e`) 기존 컨테이너를 지우기 전에 중단 |
+| `last_good_image` 기록 | 롤백 대상이 "지금 실행 중인 것"이면 연속 실패 시 **깨진 이미지를 다시 띄우는** 문제가 생김 |
+| `set -x` 사용 금지 | 켜면 비밀번호가 로그에 찍힘 |
+
+> 발견한 문제: Step 5의 롤백은 "배포 직전에 실행 중이던 이미지"로 되돌렸습니다. 실패한 배포를 다시 실행하면 그 깨진 이미지가 "직전 이미지"가 되어, 롤백이 같은 이미지를 다시 띄웠습니다.
+
+### 11-6. 트러블슈팅 기록
+
+| 증상 | 원인과 교훈 |
+|---|---|
+| `ParameterNotFound` | 해당 **리전에 그 이름의 파라미터가 없음**. 권한 문제는 `AccessDenied`로 나옴. 목록은 CloudShell에서 `aws ssm describe-parameters --region ap-northeast-2 --query "Parameters[].Name" --output text` |
+| 서버 터미널에서 `iam:GetRole` 등이 AccessDenied | 서버 역할에는 IAM/목록 조회 권한이 없음 (**의도된 최소 권한**). 조회/생성은 CloudShell(ticketing-dev)에서 |
+| `Unable to determine Dialect without JDBC metadata` | **DB 접속 실패의 이차 에러**. 진짜 원인(`Access denied`, 설정값 불일치 등)은 그 위 로그에 있음. 로그를 꼬리 50줄만 보면 잘리므로 `grep "Caused by"` |
+| 배포는 초록인데 설정값이 안 읽힘 | 환경변수/파라미터 **이름 불일치**. 앱이 읽는 이름과 저장된 이름이 같은지 확인 |
+| `docker` 명령이 `dockerDesktopLinuxEngine` 연결 실패 | **Docker Desktop이 꺼져 있음**. 실행 후 `docker version` 에서 Server 블록 확인 |
+| 여러 줄 명령이 안 먹음 | PowerShell 줄바꿈 백틱은 줄 **맨 끝**에만. 붙여넣기에서 깨지면 한 줄로 실행. 비밀번호 `read -s` 는 **한 줄씩 따로** 실행(한 번에 붙이면 다음 줄이 비밀번호로 읽힘) |
+| 서버는 정상인데 집에서만 접속 불가 | 보안그룹이 **다른 위치의 공인 IP**를 허용하지 않음 → **12장** |
+
+### 11-7. 비밀 취급 수칙
+
+- 비밀번호/토큰/키는 **채팅, README, 스크립트, 코드, 스크린샷에 쓰지 않습니다.** 노출되었다면 유출된 것으로 보고 교체합니다.
+- `deploy.sh` 에 값을 직접 쓰지 않습니다(**하드코딩 금지**). 비밀번호를 바꿀 때 스크립트를 고치게 되고, 서버 디스크에 평문이 남습니다.
+- 명령줄에 비밀번호를 직접 쓰면 셸 기록(`history`)에 남습니다. 입력창(`read -s`)으로 받습니다.
+- Parameter Store는 값이 아니라 **이름만** 조회해서 확인합니다 (`--query Parameter.Name`).
+
+### 11-8. Session Manager와 CloudShell 구분
+
+| | Session Manager | CloudShell |
+|---|---|---|
+| 모양 | 새 탭의 검은 화면 (`세션 ID`, `Instance ID` 표시) | 콘솔 화면 **하단 패널** (`>_` 아이콘) |
+| 실행 권한 | 서버 역할 `ticketing-ec2-role` | 로그인한 사용자 `ticketing-dev` |
+| 용도 | 서버 안의 작업 (docker, deploy.sh) | AWS 리소스 조회/생성/설정 |
+
+헷갈릴 때는 `aws sts get-caller-identity` 로 현재 실행 주체(`Arn`)를 확인합니다.
+
+Session Manager는 **새 세션을 열 때마다 변수가 초기화**되므로, 시작할 때 아래를 붙여넣습니다.
+
+```bash
+bash
+export REGION=ap-northeast-2
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+export ENDPOINT=<RDS_ENDPOINT>
+alias dps='sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"'
+```
+
+매번 붙여넣기 번거로우면 `Systems Manager → Session Manager → 기본 설정 → Linux shell profile` 에 `export` 줄들과 마지막 줄 `exec /bin/bash` 를 넣습니다(모든 세션에 적용되므로 **비밀 값은 넣지 않음**).
+
+---
+
+## 12. 접속 허용 IP 추가: 집/회사에서 접속할 때
+
+### 12-1. 왜 필요한가
+
+`ticketing-sg` 의 8080 규칙은 **"내 IP"** 로 만들었습니다. 이 옵션은 규칙을 만들 때 쓰던 네트워크의 **공인 IP 한 개(`x.x.x.x/32`)** 만 허용하고, 다른 곳에서 오는 요청은 **응답 없이 버립니다**(에러 없이 로딩만 계속되다 시간 초과).
+
+집, 회사, 핫스팟은 공인 IP가 서로 다르기 때문에, 서버가 정상이어도 다른 위치에서는 접속되지 않습니다. 집 인터넷은 공유기 재시작 등으로 IP가 바뀌기도 합니다(유동 IP).
+
+### 12-2. 콘솔로 추가하는 방법 (가장 쉬움)
+
+**접속하려는 PC(집)에서** AWS 콘솔에 `ticketing-dev` 로 로그인한 상태에서 진행합니다. 그래야 "내 IP"가 집 IP로 채워집니다.
+
+```
+1. 우측 상단 리전이 "아시아 태평양(서울) ap-northeast-2" 인지 확인
+2. EC2 → 왼쪽 메뉴 "보안 그룹" → ticketing-sg 선택
+3. 하단 [인바운드 규칙] 탭 → "인바운드 규칙 편집"
+4. "규칙 추가"
+     - 유형   : 사용자 지정 TCP
+     - 포트 범위 : 8080
+     - 소스   : "내 IP"  (현재 PC의 공인 IP가 자동 입력됨)
+     - 설명   : home   (위치를 구분할 이름. 나중에 정리하기 쉬움)
+5. "규칙 저장"
+```
+
+기존 규칙(원래 위치)은 **지우지 않고 그대로 둔 채 규칙을 추가**하면 두 위치 모두 접속됩니다. 규칙은 몇 초 안에 반영됩니다.
+
+### 12-3. CLI로 추가하는 방법 (CloudShell)
+
+**주의**: IP 확인은 **접속하려는 PC**에서 해야 합니다. CloudShell에서 확인하면 CloudShell의 IP가 나옵니다.
+
+```powershell
+# 접속하려는 PC (PowerShell)
+curl.exe -s https://checkip.amazonaws.com
+```
+
+```bash
+# CloudShell (ticketing-dev): 위에서 나온 IP를 넣음
+SG_ID=$(aws ec2 describe-security-groups --region ap-northeast-2 --filters Name=group-name,Values=ticketing-sg --query "SecurityGroups[].GroupId" --output text)
+
+aws ec2 authorize-security-group-ingress --region ap-northeast-2 --group-id $SG_ID \
+  --ip-permissions 'IpProtocol=tcp,FromPort=8080,ToPort=8080,IpRanges=[{CidrIp=<위에서 확인한 IP>/32,Description=home}]'
+```
+
+현재 허용된 목록 확인 / 이전 위치 규칙 삭제:
+
+```bash
+aws ec2 describe-security-groups --region ap-northeast-2 --group-ids $SG_ID \
+  --query "SecurityGroups[].IpPermissions[].IpRanges[]" --output json
+
+aws ec2 revoke-security-group-ingress --region ap-northeast-2 --group-id $SG_ID \
+  --protocol tcp --port 8080 --cidr <삭제할 IP>/32
+```
+
+### 12-4. 접속 안 될 때 점검 순서
+
+| 순서 | 확인 | 방법 |
+|---|---|---|
+| 1 | 서버 상태와 **현재 퍼블릭 IP** | `aws ec2 describe-instances --region ap-northeast-2 --instance-ids <INSTANCE_ID> --query "Reservations[].Instances[].[State.Name,PublicIpAddress]" --output text` |
+| 2 | 내 PC에서 포트 도달 | `Test-NetConnection <퍼블릭IP> -Port 8080` (`TcpTestSucceeded : True` 여야 함) |
+| 3 | 내 공인 IP가 허용 목록에 있는지 | `curl.exe -s https://checkip.amazonaws.com` 과 보안그룹 규칙 비교 |
+| 4 | 서버 안에서는 정상인지 | Session Manager에서 `curl http://localhost:8080/actuator/health` → `UP` |
+
+- 4번은 정상인데 2번이 `False` 이면 거의 항상 **보안그룹(IP)** 문제입니다.
+- Session Manager는 IP 허용과 무관하게 콘솔 로그인만 되면 접속되므로, 서버 상태를 확인하는 우회로가 됩니다.
+
+### 12-5. 주의사항
+
+- **`0.0.0.0/0`(전체 공개)으로 여는 것은 하지 않습니다.** Swagger에는 인증이 없어서 누구나 API를 실행할 수 있습니다.
+- EC2를 **중지했다가 다시 시작하면 퍼블릭 IP가 바뀝니다.** 접속 주소도 새로 확인합니다(위 12-4의 1번). 주소를 고정하려면 탄력적 IP(Elastic IP)를 연결할 수 있지만, 퍼블릭 IPv4 요금이 있고 **안 쓰는 탄력적 IP를 방치하면 과금**되므로 학습이 끝나면 반드시 해제합니다.
+- 더 이상 쓰지 않는 위치의 규칙은 삭제해서 허용 범위를 줄입니다.
+- RDS는 퍼블릭 액세스가 없으므로 PC에서 직접 접속할 수 없는 것이 정상입니다.
+
+---
+
+## 13. 진행 현황
 
 - [x] Step 0. 로컬 `bootRun` + Swagger 확인
 - [x] Step 1. Git / GitHub 저장소 연결
 - [x] Step 2. Dockerfile 작성, 로컬 컨테이너 실행, 레이어 캐시 실험
 - [x] Step 3. AWS 수동 배포 (ECR, EC2, 보안그룹, IAM 역할, Swagger 접속 확인)
 - [x] Step 4. CI: GitHub Actions 빌드, 브랜치 보호 ruleset
-- [x] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백 (실험 완료)
-- [ ] Step 6. 설정/비밀 분리(프로파일, Parameter Store) + RDS 연결
-- [ ] Step 7. 운영 습관 (로그, 비용 알림, 리소스 정리)
+- [x] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백
+- [x] Step 6. RDS 연결 + 비밀 분리(Parameter Store) + 롤백 대상 개선
+- [ ] Step 7. 운영 습관 (비용 관리, ECR 정리, 로그, 리소스 정리)
 - [ ] Step 8~ 티케팅 기능 (재고/동시성 → Redis → Kafka → SSE/대기열)
+
+남은 정리 항목: 10-10의 체크리스트(롤백 실험 되돌리기, `ecr-push-local` 키 삭제, 디버그 브랜치 삭제, 워크플로 경고 정리), 11-3의 TODO(소스의 Parameter Store 연동 방식 기록).
