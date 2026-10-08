@@ -1133,7 +1133,286 @@ aws ec2 revoke-security-group-ingress --region ap-northeast-2 --group-id $SG_ID 
 
 ---
 
-## 13. 진행 현황
+## 13. 운영 습관 (Step 7)
+
+기능이 아니라 **비용과 사고를 줄이는 루틴**입니다. 학습용 계정에서 가장 흔한 문제는 방치된 리소스에 요금이 쌓이는 것입니다.
+
+### 13-1. 켜고 끄는 루틴 (CloudShell)
+
+쓰지 않을 때는 중지합니다(EC2는 인스턴스 시간 요금, RDS는 인스턴스 요금이 멈추고 디스크 요금은 남음).
+
+```bash
+export AWS_PAGER=""      # 출력이 길어질 때 열리는 페이저(less, "(END)") 끄기. 페이저가 열리면 q 로 종료
+
+# 끌 때
+aws ec2 stop-instances --region ap-northeast-2 --instance-ids <INSTANCE_ID> --query "StoppingInstances[].CurrentState.Name" --output text
+aws rds stop-db-instance --region ap-northeast-2 --db-instance-identifier ticketing-db --query "DBInstance.DBInstanceStatus" --output text
+
+# 켤 때: RDS 먼저, 그다음 EC2
+aws rds start-db-instance --region ap-northeast-2 --db-instance-identifier ticketing-db --query "DBInstance.DBInstanceStatus" --output text
+aws rds wait db-instance-available --region ap-northeast-2 --db-instance-identifier ticketing-db
+aws ec2 start-instances --region ap-northeast-2 --instance-ids <INSTANCE_ID> --query "StartingInstances[].CurrentState.Name" --output text
+aws ec2 wait instance-running --region ap-northeast-2 --instance-ids <INSTANCE_ID>
+
+# 새 퍼블릭 IP 확인
+aws ec2 describe-instances --region ap-northeast-2 --instance-ids <INSTANCE_ID> --query "Reservations[].Instances[].[State.Name,PublicIpAddress]" --output text
+```
+
+직접 확인한 규칙들:
+
+| 규칙 | 설명 |
+|---|---|
+| `stopping` 중에는 **시작 불가** | `stopped` 가 된 뒤에만 `start-db-instance` 가능 (`InvalidDBInstanceState`) |
+| 중지 상태에서는 **수정 불가** | `Cannot modify a stopped DB Instance`. 켠 뒤에 수정 |
+| 중지 후 **7일이 지나면 RDS가 자동으로 다시 시작**됨 | 오래 안 쓸 때는 다시 중지 |
+| EC2를 켜면 **퍼블릭 IP가 바뀜** | 접속 주소를 새로 확인. 보안그룹의 "내 IP" 규칙은 그대로 유효 |
+| 컨테이너는 `--restart unless-stopped` 덕분에 **EC2가 켜지면 자동으로 올라옴** | 배포 없이 1~2분 안에 `UP` |
+| 앱은 RDS가 준비되기 전에는 DB 연결 실패로 재시작을 반복 | RDS를 먼저 `available` 로 만들면 해당 없음 |
+
+`wait` 명령은 몇 분 동안 아무 출력 없이 기다리는 것이 정상입니다. 출력이 길 때는 `--query` 로 필요한 값만 뽑는 습관을 들입니다.
+
+### 13-2. 설정 점검 사례: 출력 전체 읽기
+
+`stop-db-instance` 의 긴 출력은 RDS의 **실제 설정 전체**입니다. 여기서 안내와 다르게 들어간 두 항목을 발견했습니다.
+
+| 출력 | 의미 | 조치 |
+|---|---|---|
+| `MonitoringInterval: 60` | 향상된 모니터링이 켜져 있음 (CloudWatch 로그에 OS 지표 저장 → 비용) | 해제 |
+| `MaxAllocatedStorage: 1000` | 스토리지 자동 조정이 켜져 있고 1,000GiB까지 커질 수 있음 (비용 사고 위험) | 해제 |
+
+중지 상태에서는 수정이 안 되므로 **RDS를 켠 뒤** 수정했습니다.
+
+```bash
+aws rds modify-db-instance --region ap-northeast-2 --db-instance-identifier ticketing-db \
+  --monitoring-interval 0 --max-allocated-storage 20 --apply-immediately --query "DBInstance.DBInstanceStatus" --output text
+aws rds wait db-instance-available --region ap-northeast-2 --db-instance-identifier ticketing-db
+
+# 확인: available  0  None  20  이면 성공
+aws rds describe-db-instances --region ap-northeast-2 --db-instance-identifier ticketing-db \
+  --query "DBInstances[].[DBInstanceStatus,MonitoringInterval,MaxAllocatedStorage,AllocatedStorage]" --output text
+```
+
+- 두 설정은 재시작 없이 적용되는 종류라 서비스가 끊기지 않습니다.
+- 보안그룹이 DB 전용(`ticketing-db-sg`)인지도 이름으로 확인합니다: `aws ec2 describe-security-groups --region ap-northeast-2 --group-ids <SG_ID> --query "SecurityGroups[].GroupName" --output text`
+- 향상된 모니터링을 켜면서 생긴 IAM 역할 `rds-monitoring-role` 과 로그 그룹 `RDSOSMetrics` 는 남아 있으므로 학습 종료 시 정리합니다(13-6).
+- 교훈: 콘솔이 기본값으로 켜 두는 옵션이 있으므로, 생성 후 **실제 설정 값을 한 번 출력해서 확인**합니다.
+
+### 13-3. ECR 이미지 정리 (수명 주기 정책)
+
+배포할 때마다 이미지가 하나씩 쌓이므로 오래된 이미지를 자동으로 지웁니다.
+
+```bash
+cat > ecr-policy.json <<'EOF'
+{
+  "rules": [{
+    "rulePriority": 1,
+    "description": "최근 10개 이미지만 보관",
+    "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10 },
+    "action": { "type": "expire" }
+  }]
+}
+EOF
+
+aws ecr put-lifecycle-policy --region ap-northeast-2 --repository-name ticketing-back --lifecycle-policy-text file://ecr-policy.json
+aws ecr get-lifecycle-policy --region ap-northeast-2 --repository-name ticketing-back --query lifecyclePolicyText --output text   # 확인
+```
+
+- 10개면 `last_good_image`(롤백 대상)가 지워질 일은 거의 없습니다. 같은 이미지가 오래 정상으로 돌고 그동안 실패 배포만 10번 넘게 쌓이면 이론상 지워질 수 있으니, 그런 일이 생기면 개수를 늘립니다.
+
+### 13-4. 비용 확인
+
+콘솔: `Billing and Cost Management`
+
+| 메뉴 | 보는 것 |
+|---|---|
+| 크레딧 | 남은 크레딧과 만료일 |
+| 청구서(Bills) → 서비스별 요금 | **무엇이 비용을 만드는지**. 크레딧 적용 전 사용 금액과 적용 후 청구 금액을 구분해서 봄 |
+| 프리 티어 | 서비스별 한도 대비 사용량 |
+| 예산(Budgets) | 월 예산과 알림 (월 $10, 이메일 알림으로 설정) |
+| 비용 탐색기(Cost Explorer) | 서비스별/일별 그래프 (처음 켜면 데이터가 채워지는 데 최대 하루). CLI(`aws ce`)는 요청당 소액 과금이므로 학습 중에는 콘솔 사용 |
+
+이 프로젝트의 비용 요소:
+
+| 서비스 | 요금이 생기는 이유 | 줄이는 방법 |
+|---|---|---|
+| EC2 | 인스턴스 시간, 디스크(EBS), 퍼블릭 IPv4 | 쓰지 않을 때 중지 |
+| RDS | 인스턴스 시간, 스토리지, 백업 | 쓰지 않을 때 중지, 백업 보존 1일 |
+| ECR | 이미지 저장 용량 | 수명 주기 정책 |
+| CloudWatch | 로그 수집/보관 | 보관 기간 7일, 향상된 모니터링 해제 |
+
+- 크레딧이 적용되면 청구 금액이 0원으로 보여서 **예산 알림이 울리지 않을 수 있습니다.** 예산 설정에 크레딧을 제외하는 옵션이 있으면 사용량 기준으로 바꾸고, "예측 비용 초과" 알림을 하나 더 추가합니다(옵션 이름과 기본값은 화면 버전에 따라 다름).
+- 습관: 사용 후 RDS/EC2 중지, 주 1회 서비스별 청구서 확인, 연결 안 된 탄력적 IP/스냅샷/볼륨 정리, 리전은 서울 하나로 고정(Tag Editor 에서 "모든 리전"으로 방치된 리소스 점검).
+
+### 13-5. 로그를 CloudWatch Logs로 보내기
+
+컨테이너 로그가 컨테이너 안에만 있으면 배포 때 `docker rm -f` 와 함께 사라집니다. 서버 밖(CloudWatch)에 두면 컨테이너나 서버가 없어져도 남습니다.
+
+```
+앱 컨테이너 ──(docker awslogs 드라이버, 서버 역할 권한)──▶ CloudWatch Logs: /ticketing/back
+```
+
+**A. 로그 그룹 (보관 기간을 정해야 무한히 쌓이지 않음)**
+
+```bash
+aws logs create-log-group --region ap-northeast-2 --log-group-name /ticketing/back
+aws logs put-retention-policy --region ap-northeast-2 --log-group-name /ticketing/back --retention-in-days 7
+```
+
+**B. 서버 역할에는 이 로그 그룹에 쓰는 권한만** (그룹 생성/읽기/삭제 권한은 주지 않음)
+
+```bash
+aws iam put-role-policy --role-name ticketing-ec2-role --policy-name write-ticketing-logs --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+    "Resource": "arn:aws:logs:ap-northeast-2:<ACCOUNT_ID>:log-group:/ticketing/back:*"
+  }]
+}'
+```
+
+**C. 운영 컨테이너를 건드리기 전에 작은 컨테이너로 권한 시험 (Session Manager)**
+
+```bash
+sudo docker run --rm --log-driver awslogs \
+  --log-opt awslogs-region=ap-northeast-2 --log-opt awslogs-group=/ticketing/back \
+  --log-opt awslogs-stream=test-$(date +%s) \
+  alpine echo "hello cloudwatch"
+```
+
+**D. deploy.sh 최종본** (`/opt/ticketing/deploy.sh`). 로그 드라이버 옵션이 추가되었고, `docker run` 자체가 실패해도 롤백 경로를 타도록 고쳤습니다.
+
+```bash
+sudo tee /opt/ticketing/deploy.sh > /dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export HOME=/root
+
+IMAGE="$1"
+REGION=ap-northeast-2
+NAME=ticketing-back
+LAST_GOOD_FILE=/opt/ticketing/last_good_image    # 마지막으로 헬스체크를 통과한 이미지
+LOG_GROUP=/ticketing/back
+
+get_param() {
+  aws ssm get-parameter --name "/ticketing/prod/$1" --with-decryption \
+    --region $REGION --query Parameter.Value --output text
+}
+
+# 컨테이너를 건드리기 전에 먼저 읽음: 실패하면 기존 서비스는 그대로 유지됨
+export DB_URL="$(get_param db-url)"
+export DB_USERNAME="$(get_param db-username)"
+export DB_PASSWORD="$(get_param db-password)"
+
+run_container() {
+  docker rm -f $NAME 2>/dev/null || true
+  docker run -d --name $NAME --restart unless-stopped \
+    -p 8080:8080 \
+    -e SPRING_PROFILES_ACTIVE=prod \
+    -e DB_URL -e DB_USERNAME -e DB_PASSWORD \
+    --log-driver awslogs \
+    --log-opt awslogs-region=$REGION \
+    --log-opt awslogs-group=$LOG_GROUP \
+    "$1"
+}
+
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+docker pull "$IMAGE"
+
+PREV=$(docker inspect -f '{{.Config.Image}}' $NAME 2>/dev/null || true)
+
+healthy=0
+if run_container "$IMAGE"; then
+  for i in $(seq 1 30); do
+    if curl -fs http://localhost:8080/actuator/health > /dev/null; then
+      healthy=1
+      break
+    fi
+    sleep 2
+  done
+else
+  echo "컨테이너 시작 실패: $IMAGE" >&2
+fi
+
+if [ "$healthy" -eq 1 ]; then
+  echo "$IMAGE" > "$LAST_GOOD_FILE"
+  echo "배포 성공: $IMAGE"
+  exit 0
+fi
+
+echo "헬스체크 실패: $IMAGE" >&2
+echo "---- 핵심 에러 ----" >&2
+docker logs $NAME 2>&1 | grep -E "Caused by|ERROR|Access denied|Communications|Exception" | tail -n 15 >&2 || true
+echo "---- 마지막 로그 30줄 ----" >&2
+docker logs --tail 30 $NAME >&2 || true
+
+ROLLBACK_TO=$(cat "$LAST_GOOD_FILE" 2>/dev/null || true)
+if [ -z "$ROLLBACK_TO" ]; then ROLLBACK_TO="$PREV"; fi
+if [ -n "$ROLLBACK_TO" ] && [ "$ROLLBACK_TO" != "$IMAGE" ]; then
+  echo "마지막 정상 버전으로 롤백: $ROLLBACK_TO" >&2
+  run_container "$ROLLBACK_TO"
+fi
+exit 1
+EOF
+sudo chmod 700 /opt/ticketing/deploy.sh
+sudo bash -n /opt/ticketing/deploy.sh      # 출력이 없으면 문법 정상
+```
+
+| 변경 | 이유 |
+|---|---|
+| `--log-driver awslogs` | 컨테이너 로그를 CloudWatch로 전송 |
+| `if run_container ...; else` | `set -e` 때문에 `docker run` 실패 시 롤백 없이 종료되어 **서비스가 내려가던 약점** 제거 |
+
+**E. 로그 읽기: 서버가 아니라 CloudShell에서**
+
+```bash
+aws logs tail /ticketing/back --region ap-northeast-2 --since 10m
+aws logs tail /ticketing/back --region ap-northeast-2 --follow       # Ctrl+C 로 종료
+```
+
+Logs Insights (콘솔: CloudWatch → 로그 → Logs Insights, 로그 그룹 `/ticketing/back`)
+
+```
+fields @timestamp, @message
+| filter @message like /ERROR|Exception/
+| sort @timestamp desc
+| limit 20
+```
+
+확인한 것:
+
+| 확인 | 결과 |
+|---|---|
+| `docker inspect ticketing-back --format '{{.HostConfig.LogConfig.Type}}'` | `awslogs` |
+| `docker logs --tail 5 ticketing-back` | 로그 드라이버를 써도 서버에서 읽힘 (`deploy.sh` 의 실패 진단 출력이 동작함) |
+| CloudWatch 로그 스트림 | **컨테이너마다 스트림이 따로 생김.** 교체되어 삭제된 이전 컨테이너의 로그도 남아 있음 |
+| 앱 시작 로그 | `HikariPool-1 - Start completed`, `Database version: 8.4.9` (RDS 연결 증거), `Started TicketingBackApplication` |
+
+- **서버 역할에는 로그를 읽는 권한을 주지 않았습니다.** 서버가 침해되어도 로그를 읽거나 지울 수 없게 하는 최소 권한 설계라서, 서버 터미널에서 `aws logs tail` 을 실행하면 `AccessDenied` 가 나는 것이 정상입니다. 읽는 쪽은 CloudShell(`ticketing-dev`)입니다.
+- 로그에서 `Initializing Spring DispatcherServlet` 은 **첫 HTTP 요청이 들어온 시점**에 찍힙니다. 배포 직후의 헬스체크 요청과 시각이 맞습니다.
+- 로그 레벨을 `DEBUG` 로 올리면 SQL 파라미터 등 민감한 값이 찍힐 수 있으므로 주의합니다. CloudWatch는 수집량과 보관량에 따라 과금되므로 청구서의 CloudWatch 항목을 같이 봅니다.
+
+### 13-6. 학습이 끝났을 때 리소스 정리 순서
+
+> **삭제는 되돌릴 수 없습니다.** 학습이 모두 끝났을 때 아래 순서로 진행합니다. 순서에는 이유가 있습니다(의존 관계: 리소스를 쓰고 있는 것부터 지움).
+
+| 순서 | 대상 | 비고 |
+|---|---|---|
+| 1 | 필요한 데이터가 있으면 RDS **최종 스냅샷** 생성 | 스냅샷도 보관량에 따라 과금되므로 불필요하면 건너뜀 |
+| 2 | **EC2 인스턴스 종료**(terminate) | 중지(stop)가 아니라 종료. 루트 디스크(EBS)도 함께 삭제되는지 확인 |
+| 3 | **RDS 삭제** | 삭제 방지는 이미 해제 상태. 최종 스냅샷 생성 여부와 **자동 백업 삭제** 여부 선택 |
+| 4 | **탄력적 IP 해제** (사용했다면) | 연결 안 된 탄력적 IP는 과금 |
+| 5 | **보안그룹 삭제**: `ticketing-db-sg` 먼저, 그다음 `ticketing-sg` | `ticketing-db-sg` 규칙이 `ticketing-sg` 를 참조하므로 순서를 거꾸로 하면 삭제 거부 |
+| 6 | **ECR 저장소 삭제** (이미지 포함) | |
+| 7 | **CloudWatch 로그 그룹** 삭제: `/ticketing/back`, `RDSOSMetrics` | |
+| 8 | **Parameter Store** 삭제: `/ticketing/prod/*`, `/config/ticketing-back_prod/*` | |
+| 9 | **IAM 정리**: `ticketing-ec2-role`(인스턴스 프로파일 포함), `github-actions-deploy`, `rds-monitoring-role`, OIDC 공급자, 사용자 `ecr-push-local`(액세스 키 포함) | `ticketing-dev` 는 마지막 |
+| 10 | **GitHub**: 저장소 Variables(`AWS_ROLE_ARN`, `EC2_INSTANCE_ID`) 삭제, 필요하면 워크플로 비활성화 | 배포 잡이 실패하는 것을 막음 |
+| 11 | 확인: Tag Editor 에서 **모든 리전**의 남은 리소스 점검, 다음 날 청구서 확인 | Budgets 알림은 청구서가 0원으로 확인될 때까지 유지 |
+
+---
+
+## 14. 진행 현황
 
 - [x] Step 0. 로컬 `bootRun` + Swagger 확인
 - [x] Step 1. Git / GitHub 저장소 연결
@@ -1142,7 +1421,12 @@ aws ec2 revoke-security-group-ingress --region ap-northeast-2 --group-id $SG_ID 
 - [x] Step 4. CI: GitHub Actions 빌드, 브랜치 보호 ruleset
 - [x] Step 5. CD: OIDC → ECR → SSM 배포, 헬스체크, 롤백
 - [x] Step 6. RDS 연결 + 비밀 분리(Parameter Store) + 롤백 대상 개선
-- [ ] Step 7. 운영 습관 (비용 관리, ECR 정리, 로그, 리소스 정리)
+- [x] Step 7. 운영 습관 (켜고 끄는 루틴, RDS 설정 점검, 비용 예산, CloudWatch 로그, 정리 순서 문서화)
 - [ ] Step 8~ 티케팅 기능 (재고/동시성 → Redis → Kafka → SSE/대기열)
 
-남은 정리 항목: 10-10의 체크리스트(롤백 실험 되돌리기, `ecr-push-local` 키 삭제, 디버그 브랜치 삭제, 워크플로 경고 정리), 11-3의 TODO(소스의 Parameter Store 연동 방식 기록).
+남은 정리 항목:
+
+- [ ] ECR 수명 주기 정책 적용 확인 (13-3)
+- [ ] 10-10 체크리스트: 롤백 실험 설정 되돌리기, `ecr-push-local` 액세스 키 삭제, 디버그 브랜치 삭제, 워크플로 경고 정리(`ubuntu-24.04` 고정, `setup-java@v5`, 로그 출력 단계 조건)
+- [ ] 11-3 TODO: 소스에서 Parameter Store를 읽는 방식 기록
+- [ ] 예산: 크레딧 제외 옵션과 예측 알림 확인 (13-4)
